@@ -27,7 +27,9 @@ MAX_BYTES = 512 * 1024
 LIST_BUDGET = 380 * 1024
 
 BASE_URL = os.environ.get("BASE_URL", "").strip()
-CHUNK = int(os.environ.get("CHUNK", "6"))
+CHUNK = int(os.environ.get("CHUNK", "4"))
+PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "v2")
+DEBUG = os.environ.get("DEBUG_LOG", "1") == "1"
 STRIP_BRACKETS = os.environ.get("STRIP_BRACKETS", "0") == "1"
 DB_PATH = os.environ.get("DB_PATH", "/tmp/invoice_agent.db")
 
@@ -129,7 +131,7 @@ def lock_for(kind, key):
 # ---------------------------------------------------------------- decisions
 def pkg_key(pkg):
     p = {k: v for k, v in pkg.items() if k != "packageId"} if isinstance(pkg, dict) else pkg
-    return sha(canon(p))
+    return sha(PROMPT_VERSION + "|" + canon(p))
 
 
 def normalize(raw, pkg):
@@ -140,13 +142,23 @@ def normalize(raw, pkg):
             return None
         found = doc_refs(pkg)
         refs = []
-        for r in raw.get("evidenceRefs") or []:
-            r = str(r).strip()
-            cand = r if r.startswith("[") else f"[{r}]"
-            match = cand if cand in found else next((f for f in found if f[1:-1].strip() == r.strip("[] ")), None)
-            if match and match not in refs:
-                refs.append(match)
-        refs = refs[:3]
+        # 1) preferred: the bracketed refs inside the verbatim decisive paragraph
+        para = " ".join(str(raw.get("decisive_paragraph", "")).split())
+        if para and any(para in " ".join(s.split()) for s in flatten_strings(pkg)):
+            in_para = [r for r in REF_RE.findall(para) if r in found]
+            if len(in_para) > 3:
+                chosen = [r for r in in_para if r.strip("[]") in {str(x).strip("[] ") for x in raw.get("evidenceRefs") or []}]
+                in_para = chosen if chosen else in_para
+            refs = list(dict.fromkeys(in_para))[:3]
+        # 2) otherwise validate the model's own list against the document
+        if not refs:
+            for r in raw.get("evidenceRefs") or []:
+                r = str(r).strip()
+                cand = r if r.startswith("[") else f"[{r}]"
+                match = cand if cand in found else next((f for f in found if f[1:-1].strip() == r.strip("[] ")), None)
+                if match and match not in refs:
+                    refs.append(match)
+            refs = refs[:3]
         if not refs:
             return None
         f = raw.get("facts") or {}
@@ -203,6 +215,11 @@ def decide(packages, llm):
         todo = [i for i, r in enumerate(result) if r is None]
     for i in todo:
         result[i] = fallback(packages[i])
+    if DEBUG:
+        for pkg, dec in zip(packages, result):
+            print("DECISION", json.dumps({"pkg": pkg.get("packageId") if isinstance(pkg, dict) else None,
+                  "action": dec["action"], "refs": dec["evidenceRefs"], "facts": dec["facts"],
+                  "fallback": bool(dec.get("_fallback"))}, ensure_ascii=False), flush=True)
     return result
 
 
