@@ -28,9 +28,9 @@ LIST_BUDGET = 380 * 1024
 
 BASE_URL = os.environ.get("BASE_URL", "").strip()
 CHUNK = int(os.environ.get("CHUNK", "4"))
-PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "v2")
+PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "v3")
 DEBUG = os.environ.get("DEBUG_LOG", "1") == "1"
-STRIP_BRACKETS = os.environ.get("STRIP_BRACKETS", "0") == "1"
+STRIP_BRACKETS = os.environ.get("STRIP_BRACKETS", "1") == "1"
 DB_PATH = os.environ.get("DB_PATH", "/tmp/invoice_agent.db")
 
 REF_RE = re.compile(r"\[[A-Za-z0-9][^\[\]\"\n,]{0,80}\]")
@@ -171,7 +171,7 @@ def normalize(raw, pkg):
             "amountMinor": int(round(float(amt))),
             "currency": str(f.get("currency", "")).upper(),
         }
-        out_refs = [r.strip("[]") for r in refs] if STRIP_BRACKETS else refs
+        out_refs = refs
         return {"action": action, "facts": facts, "evidenceRefs": out_refs,
                 "rationale": str(raw.get("rationale", ""))}
     except Exception:
@@ -182,7 +182,7 @@ def fallback(pkg):
     refs = doc_refs(pkg)[:3]
     return {"action": "open_exception",
             "facts": {"vendorName": "", "invoiceNumber": "", "amountMinor": 0, "currency": ""},
-            "evidenceRefs": [r.strip("[]") for r in refs] if STRIP_BRACKETS else refs,
+            "evidenceRefs": refs,
             "rationale": "", "_fallback": True}
 
 
@@ -297,10 +297,11 @@ def new_batch(principal, message, mh, llm):
             pid = f"{pid}-{idx}"
         seen.add(pid)
         action_id = "act_" + sha(f"{principal}|{batch_id}|{pid}|{dec['action']}")[:24]
+        out_refs = [r.strip("[]").strip() for r in dec["evidenceRefs"]] if STRIP_BRACKETS else list(dec["evidenceRefs"])
         proposals.append({
             "packageId": pid, "actionId": action_id, "action": dec["action"],
-            "facts": dec["facts"], "evidenceRefs": dec["evidenceRefs"],
-            "rationale": make_rationale(dec["action"], dec["evidenceRefs"], dec["rationale"]),
+            "facts": dec["facts"], "evidenceRefs": out_refs,
+            "rationale": make_rationale(dec["action"], out_refs, dec["rationale"]),
         })
 
     task_id, ctx = "task_" + uuid.uuid4().hex, message.get("contextId") or "ctx_" + uuid.uuid4().hex
