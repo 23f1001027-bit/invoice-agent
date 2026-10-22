@@ -130,7 +130,9 @@ def keyword_action(text):
     # 5. clean and within authority -> settle
     if has(r"within[^.]{0,60}(authority|limit|delegation|threshold)|reconcile[ds]?[^.]{0,90}(without|with no) "
            r"(an )?exception|with no exception|agree within the stated rounding tolerance|same payable total|covers every billed unit|"
-           r"may be settled|cleared for (payment|settlement)|approved for payment|release(d)? for payment"):
+           r"(may|can|should) be (settled|paid|released)|cleared for (payment|settlement)|approved for (payment|settlement)|"
+           r"release(d)? for payment|eligible for (payment|settlement)|no payment was made for this|"
+           r"no (paid item|prior settlement|earlier posting|prior payment) (with|for)|settle it\b"):
         return "settle_invoice"
     return None
 

@@ -28,7 +28,7 @@ LIST_BUDGET = 380 * 1024
 
 BASE_URL = os.environ.get("BASE_URL", "").strip()
 CHUNK = int(os.environ.get("CHUNK", "12"))
-PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "v7") + "|" + os.environ.get("LLM_MODEL", "gpt-4.1-mini")
+PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "v8") + "|" + os.environ.get("LLM_MODEL", "gpt-4.1-mini")
 DEBUG = os.environ.get("DEBUG_LOG", "1") == "1"
 STRIP_BRACKETS = os.environ.get("STRIP_BRACKETS", "1") == "1"
 DB_PATH = os.environ.get("DB_PATH", "/tmp/invoice_agent.db")
