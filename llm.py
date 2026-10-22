@@ -1,171 +1,175 @@
-"""Model layer: one batched call per chunk of packages. Any OpenAI-compatible API works.
+"""Decision layer.
 
-Token savers:
-- packages are sent as plain text (not JSON-escaped), with an id on every paragraph that
-  carries bracketed references, so the model answers with a short paragraph id instead of
-  copying the paragraph back;
-- the model writes a short analysis only; the rationale is assembled in Python.
+1. Python pulls the facts from the cover sheet and the candidate evidence paragraphs
+   (every paragraph with bracketed references except the cover-sheet one).  No tokens.
+2. ONE small model call per batch sees only those candidate paragraphs and picks the
+   decisive one and the action (~150 input tokens per package instead of ~1,000).
+3. If the model is unavailable (429, timeout), a keyword classifier decides instead,
+   so a provider failure never turns into one blanket action.
 """
 import json
 import os
 import re
+import threading
 import time
 
 import httpx
 
 LLM_URL = os.environ.get("LLM_URL", "https://aipipe.org/openai/v1/chat/completions")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
-FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "gpt-4.1-nano")
-REASONING = os.environ.get("REASONING_EFFORT", "low")
 TOKEN = os.environ.get("AIPIPE_TOKEN", "")
-PRIMARY_TIMEOUT = float(os.environ.get("PRIMARY_TIMEOUT", "24"))
-CLIENT = httpx.Client(timeout=httpx.Timeout(40.0, connect=5.0))
+MAX_PARALLEL = int(os.environ.get("LLM_PARALLEL", "2"))
+CLIENT = httpx.Client(timeout=httpx.Timeout(30.0, connect=5.0))
+GATE = threading.Semaphore(MAX_PARALLEL)          # global: protects the provider rate limit
 
 REF_RE = re.compile(r"\[[A-Za-z0-9][^\[\]\"\n,]{0,80}\]")
+ACTIONS = ["settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"]
+DECOY_RE = re.compile(r"^\s*(archive|training|example|historic|superseded|old draft)|non-operative|"
+                      r"not (a|an) (case )?instruction|vocabulary, not|explicitly labelled as training", re.I)
+COVER_RE = re.compile(r"supplier\s+(?P<v>[^;]+?)\s*;\s*invoice\s+(?P<n>[^;\s]+)\s*;\s*stated total\s+"
+                      r"(?P<c>[A-Z]{3})\s*(?P<a>[0-9][0-9,]*(?:\.[0-9]+)?)", re.I)
+ZERO_DEC = {"JPY", "KRW", "VND", "CLP", "ISK"}
 
-SYSTEM = """You are an accounts-payable controller. For EACH invoice package choose exactly ONE action:
+SYSTEM = """You are an accounts-payable controller. Each invoice package below lists its candidate evidence paragraphs (A, B, C...). Exactly one paragraph is DECISIVE: it states the conclusion for THIS invoice. Archive notes, training appendices, examples and superseded drafts are never decisive, even if they contain action words.
 
-- settle_invoice: valid, records reconcile, amount within autonomous authority.
-- request_approval: commercially valid, but amount/terms are OUTSIDE delegated authority, so an approver must sign off.
-- hold_invoice: payment must PAUSE until a stated verification completes (bank-detail callback, missing certificate, pending confirmation...).
-- reject_duplicate: the SAME commercial invoice (same vendor + same invoice number) was ALREADY PAID. A payment for a DIFFERENT invoice number is NOT a duplicate.
-- open_exception: material records conflict (amount, currency, vendor, quantity disagree between documents) and need an exception workflow.
+Choose the action that the decisive paragraph determines:
+- settle_invoice: records reconcile and the amount is WITHIN autonomous authority; nothing pending.
+- request_approval: commercially valid / payable but OUTSIDE the operator's authority, so the approval workflow is needed.
+- hold_invoice: payment must pause until a stated verification completes (callback, certificate, confirmation pending).
+- reject_duplicate: this SAME invoice (same vendor and invoice number) was already paid. A payment for a DIFFERENT invoice is not a duplicate.
+- open_exception: material records conflict (amount, currency, vendor, quantity, bank details disagree) and need an exception workflow.
+Respect negation ("no hold is needed", "is not a duplicate", "does not exceed").
 
-Packages contain several documents. Paragraphs that carry bracketed references are labelled like <P12>.
-The cover/intake sheet only summarises the invoice (supplier, invoice number, total); its reference is never decisive.
-Ignore noise: office/queue/footer/timestamp text, training examples, archive or historic cases, superseded drafts or old policy revisions, and sentences that merely mention action words. Respect negation ("no hold is required", "not a duplicate"), thresholds and dates.
-
-For each package:
-1. Find the ONE labelled paragraph (answer with its label, e.g. "P12", and copy its bracketed references into evidenceRefs) that states the conclusion for THIS invoice under the CURRENT policy revision (normally it carries exactly three bracketed references).
-2. "analysis": max 45 words with the controlling facts (e.g. amount vs limit, which invoice was paid, which verification is pending, which records conflict).
-3. "action": the action that paragraph determines.
-4. "facts": from the CONTROLLING invoice (cover sheet values unless a signed record explicitly corrects them). amountMinor = integer in minor units (x100 for INR/USD/EUR/GBP/AED etc., x1 for JPY/KRW). "amountText" = the total exactly as printed.
-
-Reply with JSON only:
-{"decisions":[{"index":0,"paragraph":"P12","evidenceRefs":["[..]","[..]","[..]"],"analysis":"...","action":"...","facts":{"vendorName":"...","invoiceNumber":"...","amountText":"...","amountMinor":0,"currency":"INR"}}]}
-Return exactly one decision per package."""
-
-_logged = {"n": 0}
+Reply with JSON only: {"decisions":[{"index":0,"paragraph":"A","action":"...","why":"one short sentence"}]}"""
 
 
-def _paragraphs(s):
-    """Split a document string into paragraphs; blocks with >3 refs are split per line."""
+# ------------------------------------------------------------------ extraction (no tokens)
+def _texts(pkg):
+    docs = pkg.get("documents") if isinstance(pkg, dict) else None
+    if isinstance(docs, list):
+        return [(str(d.get("name", "")), str(d.get("text", ""))) for d in docs if isinstance(d, dict)]
     out = []
-    for block in re.split(r"\n\s*\n", s):
-        if len(REF_RE.findall(block)) > 3 and "\n" in block:
-            out.extend(l for l in block.split("\n") if l.strip())
-        elif block.strip():
-            out.append(block)
+
+    def walk(o, label):
+        if isinstance(o, str):
+            out.append((label, o))
+        elif isinstance(o, dict):
+            for k, v in o.items():
+                if k not in ("packageId", "receivedAt"):
+                    walk(v, k)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v, label)
+    walk(pkg, "")
     return out
 
 
-def render(pkg, pmap):
-    """Render a package as labelled plain text. pmap collects paragraph id -> text."""
-    lines = []
-
-    def walk(obj, label):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if k == "packageId":
-                    continue
-                walk(v, f"{label}.{k}" if label else k)
-        elif isinstance(obj, list):
-            for i, v in enumerate(obj):
-                walk(v, f"{label}[{i}]")
-        elif isinstance(obj, str):
-            if "\n" not in obj and len(obj) < 120 and not REF_RE.search(obj):
-                lines.append(f"{label}: {obj}")
-                return
-            lines.append(f"## {label}")
-            for para in _paragraphs(obj):
-                if REF_RE.search(para):
-                    pid = f"P{len(pmap)}"
-                    pmap[pid] = para
-                    lines.append(f"<{pid}> {para.strip()}")
-                else:
-                    lines.append(para.strip())
-        elif obj is not None:
-            lines.append(f"{label}: {obj}")
-
-    walk(pkg, "")
-    return "\n".join(lines)
+def extract(pkg):
+    facts, candidates, cover_para = None, [], None
+    for name, text in _texts(pkg):
+        for para in re.split(r"\n\s*\n", text):
+            para = para.strip()
+            if not para:
+                continue
+            m = COVER_RE.search(para)
+            if m and facts is None:
+                cur = m["c"].upper()
+                amt = float(m["a"].replace(",", ""))
+                facts = {"vendorName": m["v"].strip(), "invoiceNumber": m["n"].strip().rstrip(".,"),
+                         "amountMinor": int(round(amt * (1 if cur in ZERO_DEC else 100))), "currency": cur}
+                cover_para = para
+                continue
+            refs = list(dict.fromkeys(REF_RE.findall(para)))
+            if refs:
+                candidates.append({"text": para, "refs": refs, "decoy": bool(DECOY_RE.search(para)),
+                                   "doc": name})
+    # most likely decisive first: three refs, not a decoy
+    candidates.sort(key=lambda c: (c["decoy"], len(c["refs"]) != 3))
+    return facts, cover_para, candidates
 
 
-def _amount_from_text(text, currency):
-    t = re.sub(r"[^0-9.]", "", str(text or ""))
-    if not t or t.count(".") > 1:
-        return None
-    zero_dec = currency.upper() in {"JPY", "KRW"}
-    if "." in t:
-        return int(round(float(t) * (1 if zero_dec else 100)))
-    # no decimals printed: only trust it when it looks like a formatted major amount
-    if re.search(r"[,₹$€£¥]|[A-Z]{3}", str(text)):
-        return int(t) * (1 if zero_dec else 100)
-    return None
+# ------------------------------------------------------------------ keyword fallback
+def keyword_action(text):
+    t = text.lower()
+    neg = lambda w: re.search(r"\b(no|not|never|without|nor|rather than)\b[^.]{0,40}" + w, t)
+    if re.search(r"conflict|mismatch|disagree|do not agree|does not agree|inconsistent|differs? from|"
+                 r"discrepanc|exception workflow", t) and not neg(r"(conflict|mismatch|discrepanc)"):
+        return "open_exception"
+    if re.search(r"already (been )?paid|previously paid|paid in full|duplicate (payment|submission|of)|"
+                 r"same invoice", t) and not neg(r"(paid|duplicate)"):
+        return "reject_duplicate"
+    if re.search(r"outside[^.]{0,40}authority|exceeds?[^.]{0,40}(authority|limit|threshold)|"
+                 r"approval workflow|financial-approval|requires? (an? )?approv", t):
+        return "request_approval"
+    if re.search(r"\bhold\b|pause|pending|callback|until[^.]{0,60}(verif|confirm|receiv)|awaiting", t) \
+            and not neg(r"(hold|pause|pending)"):
+        return "hold_invoice"
+    return "settle_invoice"
 
 
-def _post(model, user, timeout=None):
-    body = {"model": model, "response_format": {"type": "json_object"},
+# ------------------------------------------------------------------ model call
+def _post(user, deadline):
+    body = {"model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]}
-    if model.startswith(("gpt-5", "o3", "o4")):
-        body["reasoning_effort"] = REASONING
-    else:
-        body["temperature"] = 0
-    r = CLIENT.post(LLM_URL, headers={"Authorization": f"Bearer {TOKEN}"}, json=body,
-                    timeout=httpx.Timeout(timeout or 40.0, connect=5.0))
-    r.raise_for_status()
-    j = r.json()
-    print("LLM usage", model, json.dumps(j.get("usage", {})), flush=True)
-    text = j["choices"][0]["message"]["content"]
-    return json.loads(re.search(r"\{.*\}", text, re.S).group(0)).get("decisions", [])
+    delay = 1.5
+    while True:
+        left = deadline - time.time()
+        if left < 4:
+            raise TimeoutError("no time left for the model")
+        with GATE:
+            r = CLIENT.post(LLM_URL, headers={"Authorization": f"Bearer {TOKEN}"}, json=body,
+                            timeout=httpx.Timeout(min(25.0, left), connect=5.0))
+        if r.status_code in (429, 500, 502, 503) and deadline - time.time() > delay + 6:
+            print("LLM", r.status_code, "retrying in", delay, flush=True)
+            time.sleep(delay)
+            delay *= 2
+            continue
+        r.raise_for_status()
+        j = r.json()
+        print("LLM usage", json.dumps(j.get("usage", {})), flush=True)
+        text = j["choices"][0]["message"]["content"]
+        return json.loads(re.search(r"\{.*\}", text, re.S).group(0)).get("decisions", [])
 
 
 def llm(packages):
-    """packages: list of package dicts. Returns a list of raw decision dicts aligned with `packages`."""
-    if _logged["n"] < 1 and packages:           # one sample in the logs helps tuning
-        _logged["n"] += 1
-        print("SAMPLE PACKAGE:", json.dumps(packages[0], ensure_ascii=False)[:6000], flush=True)
-    pmaps, chunks = [], []
-    for i, p in enumerate(packages):
-        pm = {}
-        chunks.append(f"=== PACKAGE index={i} ===\n{render(p, pm)}")
-        pmaps.append(pm)
-    user = "\n\n".join(chunks)
-
+    """Returns raw decision dicts aligned with `packages` (core.normalize validates them)."""
     t0 = time.time()
-    try:
-        decisions = _post(LLM_MODEL, user, PRIMARY_TIMEOUT)
-    except Exception as exc:
-        print("primary model failed:", repr(exc), flush=True)
-        left = 40 - (time.time() - t0)
-        if not FALLBACK_MODEL or left < 6:
-            raise
-        decisions = _post(FALLBACK_MODEL, user, left)
+    extracted = [extract(p) for p in packages]
+    blocks = []
+    for i, (facts, cover, cands) in enumerate(extracted):
+        lines = [f"=== PACKAGE index={i} ==="]
+        if facts:
+            lines.append(f"Invoice: {facts['vendorName']} / {facts['invoiceNumber']} / "
+                         f"{facts['currency']} {facts['amountMinor']} minor units")
+        elif cover:
+            lines.append("Cover: " + cover)
+        for k, c in enumerate(cands[:6]):
+            lines.append(f"{chr(65 + k)}: {c['text']}")
+        blocks.append("\n".join(lines))
 
-    aligned = [None] * len(packages)
-    for d in decisions:
-        if not (isinstance(d, dict) and isinstance(d.get("index"), int) and 0 <= d["index"] < len(packages)):
+    model = {}
+    try:
+        for d in _post("\n\n".join(blocks), t0 + 32):
+            if isinstance(d, dict) and isinstance(d.get("index"), int):
+                model[d["index"]] = d
+    except Exception as exc:
+        print("model unavailable, using keyword rules:", repr(exc), flush=True)
+
+    out = []
+    for i, (facts, cover, cands) in enumerate(extracted):
+        if not cands:
+            out.append(None)
             continue
-        i = d["index"]
-        pid = str(d.get("paragraph", "")).strip("<> ").upper()
-        if pid.isdigit():
-            pid = "P" + pid
-        para = pmaps[i].get(pid, "")
-        refs = list(dict.fromkeys(REF_RE.findall(para)))
-        if len(refs) != 3:                       # label missing/wrong: trust the model's refs if they exist in the package
-            known = {r for p in pmaps[i].values() for r in REF_RE.findall(p)}
-            mine = [r if str(r).startswith("[") else f"[{r}]" for r in d.get("evidenceRefs") or []]
-            mine = [r for r in dict.fromkeys(mine) if r in known]
-            if mine:
-                refs = mine
-                para = next((p for p in pmaps[i].values() if all(r in p for r in mine)), "")
-            print("PARAGRAPH MISS", pid, refs, flush=True)
-        f = d.get("facts") or {}
-        cur = str(f.get("currency", "")).upper()
-        amt = _amount_from_text(f.get("amountText"), cur)
-        if amt is not None and amt != f.get("amountMinor"):
-            print("AMOUNT FIX", f.get("amountText"), f.get("amountMinor"), "->", amt, flush=True)
-            f["amountMinor"] = amt
-        aligned[i] = {"action": d.get("action"), "decisive_paragraph": para, "evidenceRefs": refs[:3],
-                      "facts": f, "rationale": str(d.get("analysis", ""))}
-    return aligned
+        d = model.get(i) or {}
+        k = ord(str(d.get("paragraph", "A")).strip()[:1].upper() or "A") - 65
+        chosen = cands[k] if 0 <= k < len(cands[:6]) and not cands[k]["decoy"] else cands[0]
+        action = d.get("action") if d.get("action") in ACTIONS else keyword_action(chosen["text"])
+        src = "model" if d.get("action") in ACTIONS else "rules"
+        if facts is None:
+            facts = {"vendorName": "", "invoiceNumber": "", "amountMinor": 0, "currency": ""}
+            print("COVER NOT PARSED", json.dumps(cover or "")[:300], flush=True)
+        print("PICK", i, src, action, "|", chosen["text"][:160], flush=True)
+        out.append({"action": action, "decisive_paragraph": chosen["text"], "evidenceRefs": chosen["refs"][:3],
+                    "facts": dict(facts), "rationale": str(d.get("why", "")),
+                    "_quote": chosen["text"], "_src": src})
+    return out

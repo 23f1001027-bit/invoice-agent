@@ -27,8 +27,8 @@ MAX_BYTES = 512 * 1024
 LIST_BUDGET = 380 * 1024
 
 BASE_URL = os.environ.get("BASE_URL", "").strip()
-CHUNK = int(os.environ.get("CHUNK", "2"))
-PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "v4") + "|" + os.environ.get("LLM_MODEL", "gpt-4.1-mini")
+CHUNK = int(os.environ.get("CHUNK", "12"))
+PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "v5") + "|" + os.environ.get("LLM_MODEL", "gpt-4.1-mini")
 DEBUG = os.environ.get("DEBUG_LOG", "1") == "1"
 STRIP_BRACKETS = os.environ.get("STRIP_BRACKETS", "1") == "1"
 DB_PATH = os.environ.get("DB_PATH", "/tmp/invoice_agent.db")
@@ -173,7 +173,8 @@ def normalize(raw, pkg):
         }
         out_refs = refs
         return {"action": action, "facts": facts, "evidenceRefs": out_refs,
-                "rationale": str(raw.get("rationale", ""))}
+                "rationale": str(raw.get("rationale", "")), "quote": str(raw.get("_quote", "")),
+                "src": raw.get("_src", "model")}
     except Exception:
         return None
 
@@ -198,7 +199,7 @@ def decide(packages, llm):
                 for n, i in enumerate(idxs)}
 
     t0 = time.time()
-    for attempt in range(2):                      # second pass only retries failures
+    for attempt in range(1):
         if not todo or (attempt and time.time() - t0 > 12):
             break
         chunks = [todo[i:i + CHUNK] for i in range(0, len(todo), CHUNK)]
@@ -212,7 +213,8 @@ def decide(packages, llm):
         for i, dec in got.items():
             if dec:
                 result[i] = dec
-                STORE.save_decision(keys[i], dec)
+                if dec.get("src") == "model":         # rule-based answers are retried next time
+                    STORE.save_decision(keys[i], dec)
         todo = [i for i, r in enumerate(result) if r is None]
     for i in todo:
         result[i] = fallback(packages[i])
@@ -220,16 +222,17 @@ def decide(packages, llm):
         for pkg, dec in zip(packages, result):
             print("DECISION", json.dumps({"pkg": pkg.get("packageId") if isinstance(pkg, dict) else None,
                   "action": dec["action"], "refs": dec["evidenceRefs"], "facts": dec["facts"],
-                  "fallback": bool(dec.get("_fallback"))}, ensure_ascii=False), flush=True)
+                  "fallback": bool(dec.get("_fallback")), "src": dec.get("src")}, ensure_ascii=False), flush=True)
     return result
 
 
-def make_rationale(action, refs, text):
+def make_rationale(action, refs, text, quote=""):
     t = " ".join((text or "").split()).rstrip(".")
-    lead = f"Action {action}: " + (t + ". " if t else "")
-    out = lead + f"The decisive paragraph cites {', '.join(refs[:3])}, which support {action} for this invoice under the current policy revision."
-    if len(out) < 60:
-        out += " Other references in the package are cover-sheet, archive or example material."
+    out = f"Action {action}" + (f": {t}." if t else ".")
+    q = " ".join((quote or "").split())
+    if q:
+        out += f" The controlling record states: \"{q}\""
+    out += f" Evidence {', '.join(refs[:3])} therefore supports {action} for this invoice; archive, training and cover-sheet references are not decisive."
     return out[:1500]
 
 
@@ -301,7 +304,7 @@ def new_batch(principal, message, mh, llm):
         proposals.append({
             "packageId": pid, "actionId": action_id, "action": dec["action"],
             "facts": dec["facts"], "evidenceRefs": out_refs,
-            "rationale": make_rationale(dec["action"], out_refs, dec["rationale"]),
+            "rationale": make_rationale(dec["action"], out_refs, dec["rationale"], dec.get("quote", "")),
         })
 
     task_id, ctx = "task_" + uuid.uuid4().hex, message.get("contextId") or "ctx_" + uuid.uuid4().hex
