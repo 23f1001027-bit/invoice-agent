@@ -14,10 +14,11 @@ import time
 import httpx
 
 LLM_URL = os.environ.get("LLM_URL", "https://aipipe.org/openai/v1/chat/completions")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-5-mini")
-FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "gpt-4.1-mini")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
+FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "gpt-4.1-nano")
 REASONING = os.environ.get("REASONING_EFFORT", "low")
 TOKEN = os.environ.get("AIPIPE_TOKEN", "")
+PRIMARY_TIMEOUT = float(os.environ.get("PRIMARY_TIMEOUT", "24"))
 CLIENT = httpx.Client(timeout=httpx.Timeout(40.0, connect=5.0))
 
 REF_RE = re.compile(r"\[[A-Za-z0-9][^\[\]\"\n,]{0,80}\]")
@@ -35,13 +36,13 @@ The cover/intake sheet only summarises the invoice (supplier, invoice number, to
 Ignore noise: office/queue/footer/timestamp text, training examples, archive or historic cases, superseded drafts or old policy revisions, and sentences that merely mention action words. Respect negation ("no hold is required", "not a duplicate"), thresholds and dates.
 
 For each package:
-1. Find the ONE labelled paragraph that states the conclusion for THIS invoice under the CURRENT policy revision (normally it carries exactly three bracketed references).
+1. Find the ONE labelled paragraph (answer with its label, e.g. "P12", and copy its bracketed references into evidenceRefs) that states the conclusion for THIS invoice under the CURRENT policy revision (normally it carries exactly three bracketed references).
 2. "analysis": max 45 words with the controlling facts (e.g. amount vs limit, which invoice was paid, which verification is pending, which records conflict).
 3. "action": the action that paragraph determines.
 4. "facts": from the CONTROLLING invoice (cover sheet values unless a signed record explicitly corrects them). amountMinor = integer in minor units (x100 for INR/USD/EUR/GBP/AED etc., x1 for JPY/KRW). "amountText" = the total exactly as printed.
 
 Reply with JSON only:
-{"decisions":[{"index":0,"paragraph":"P12","analysis":"...","action":"...","facts":{"vendorName":"...","invoiceNumber":"...","amountText":"...","amountMinor":0,"currency":"INR"}}]}
+{"decisions":[{"index":0,"paragraph":"P12","evidenceRefs":["[..]","[..]","[..]"],"analysis":"...","action":"...","facts":{"vendorName":"...","invoiceNumber":"...","amountText":"...","amountMinor":0,"currency":"INR"}}]}
 Return exactly one decision per package."""
 
 _logged = {"n": 0}
@@ -103,14 +104,15 @@ def _amount_from_text(text, currency):
     return None
 
 
-def _post(model, user):
+def _post(model, user, timeout=None):
     body = {"model": model, "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]}
     if model.startswith(("gpt-5", "o3", "o4")):
         body["reasoning_effort"] = REASONING
     else:
         body["temperature"] = 0
-    r = CLIENT.post(LLM_URL, headers={"Authorization": f"Bearer {TOKEN}"}, json=body)
+    r = CLIENT.post(LLM_URL, headers={"Authorization": f"Bearer {TOKEN}"}, json=body,
+                    timeout=httpx.Timeout(timeout or 40.0, connect=5.0))
     r.raise_for_status()
     j = r.json()
     print("LLM usage", model, json.dumps(j.get("usage", {})), flush=True)
@@ -132,21 +134,32 @@ def llm(packages):
 
     t0 = time.time()
     try:
-        decisions = _post(LLM_MODEL, user)
+        decisions = _post(LLM_MODEL, user, PRIMARY_TIMEOUT)
     except Exception as exc:
         print("primary model failed:", repr(exc), flush=True)
-        if not FALLBACK_MODEL or time.time() - t0 > 25:
+        left = 40 - (time.time() - t0)
+        if not FALLBACK_MODEL or left < 6:
             raise
-        decisions = _post(FALLBACK_MODEL, user)
+        decisions = _post(FALLBACK_MODEL, user, left)
 
     aligned = [None] * len(packages)
     for d in decisions:
         if not (isinstance(d, dict) and isinstance(d.get("index"), int) and 0 <= d["index"] < len(packages)):
             continue
         i = d["index"]
-        pid = str(d.get("paragraph", "")).strip("<> ")
+        pid = str(d.get("paragraph", "")).strip("<> ").upper()
+        if pid.isdigit():
+            pid = "P" + pid
         para = pmaps[i].get(pid, "")
         refs = list(dict.fromkeys(REF_RE.findall(para)))
+        if len(refs) != 3:                       # label missing/wrong: trust the model's refs if they exist in the package
+            known = {r for p in pmaps[i].values() for r in REF_RE.findall(p)}
+            mine = [r if str(r).startswith("[") else f"[{r}]" for r in d.get("evidenceRefs") or []]
+            mine = [r for r in dict.fromkeys(mine) if r in known]
+            if mine:
+                refs = mine
+                para = next((p for p in pmaps[i].values() if all(r in p for r in mine)), "")
+            print("PARAGRAPH MISS", pid, refs, flush=True)
         f = d.get("facts") or {}
         cur = str(f.get("currency", "")).upper()
         amt = _amount_from_text(f.get("amountText"), cur)

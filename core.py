@@ -27,8 +27,8 @@ MAX_BYTES = 512 * 1024
 LIST_BUDGET = 380 * 1024
 
 BASE_URL = os.environ.get("BASE_URL", "").strip()
-CHUNK = int(os.environ.get("CHUNK", "3"))
-PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "v4") + "|" + os.environ.get("LLM_MODEL", "gpt-5-mini")
+CHUNK = int(os.environ.get("CHUNK", "2"))
+PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "v4") + "|" + os.environ.get("LLM_MODEL", "gpt-4.1-mini")
 DEBUG = os.environ.get("DEBUG_LOG", "1") == "1"
 STRIP_BRACKETS = os.environ.get("STRIP_BRACKETS", "1") == "1"
 DB_PATH = os.environ.get("DB_PATH", "/tmp/invoice_agent.db")
@@ -199,12 +199,12 @@ def decide(packages, llm):
 
     t0 = time.time()
     for attempt in range(2):                      # second pass only retries failures
-        if not todo or (attempt and time.time() - t0 > 20):
+        if not todo or (attempt and time.time() - t0 > 12):
             break
         chunks = [todo[i:i + CHUNK] for i in range(0, len(todo), CHUNK)]
         got = {}
         try:
-            with ThreadPoolExecutor(max_workers=min(6, len(chunks))) as ex:
+            with ThreadPoolExecutor(max_workers=min(8, len(chunks))) as ex:
                 for part in ex.map(run, chunks):
                     got.update(part)
         except Exception as exc:
