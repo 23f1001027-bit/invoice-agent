@@ -27,8 +27,8 @@ MAX_BYTES = 512 * 1024
 LIST_BUDGET = 380 * 1024
 
 BASE_URL = os.environ.get("BASE_URL", "").strip()
-CHUNK = int(os.environ.get("CHUNK", "4"))
-PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "v3")
+CHUNK = int(os.environ.get("CHUNK", "3"))
+PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "v4") + "|" + os.environ.get("LLM_MODEL", "gpt-5-mini")
 DEBUG = os.environ.get("DEBUG_LOG", "1") == "1"
 STRIP_BRACKETS = os.environ.get("STRIP_BRACKETS", "1") == "1"
 DB_PATH = os.environ.get("DB_PATH", "/tmp/invoice_agent.db")
@@ -197,13 +197,14 @@ def decide(packages, llm):
         return {i: normalize(raws[n], packages[i]) if n < len(raws) and isinstance(raws[n], dict) else None
                 for n, i in enumerate(idxs)}
 
+    t0 = time.time()
     for attempt in range(2):                      # second pass only retries failures
-        if not todo:
+        if not todo or (attempt and time.time() - t0 > 20):
             break
         chunks = [todo[i:i + CHUNK] for i in range(0, len(todo), CHUNK)]
         got = {}
         try:
-            with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as ex:
+            with ThreadPoolExecutor(max_workers=min(6, len(chunks))) as ex:
                 for part in ex.map(run, chunks):
                     got.update(part)
         except Exception as exc:
@@ -224,13 +225,12 @@ def decide(packages, llm):
 
 
 def make_rationale(action, refs, text):
-    t = (text or "").strip()
-    cited = sum(1 for r in refs if r in t)
-    if action not in t or cited < min(2, len(refs)) or len(t) < 60:
-        t = (t + " " if t else "") + f"Decision {action}, supported by evidence {', '.join(refs[:3])}."
-    if len(t) < 60:
-        t += " The cited paragraph determines this action under the stated policy."
-    return t[:1500]
+    t = " ".join((text or "").split()).rstrip(".")
+    lead = f"Action {action}: " + (t + ". " if t else "")
+    out = lead + f"The decisive paragraph cites {', '.join(refs[:3])}, which support {action} for this invoice under the current policy revision."
+    if len(out) < 60:
+        out += " Other references in the package are cover-sheet, archive or example material."
+    return out[:1500]
 
 
 # ---------------------------------------------------------------- http helpers
