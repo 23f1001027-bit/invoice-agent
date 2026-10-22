@@ -10,7 +10,9 @@ import core, llm
 
 data = json.load(open(sys.argv[1] if len(sys.argv) > 1 else "sample.json"))
 pkgs = data if isinstance(data, list) else data.get("packages", [data])
-pm = {}
-print(llm.render(pkgs[0], pm)[:3000], "\n...")
+facts, cover, cands = llm.extract(pkgs[0])
+print("facts:", facts)
+for c in cands:
+    print("candidate", "(decoy)" if c["decoy"] else "", c["refs"], "|", c["text"][:120])
 for p, d in zip(pkgs, core.decide(pkgs, llm.llm)):
     print(json.dumps({"pkg": p.get("packageId"), **d}, indent=1, ensure_ascii=False))

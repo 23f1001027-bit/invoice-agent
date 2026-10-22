@@ -18,6 +18,7 @@ import httpx
 LLM_URL = os.environ.get("LLM_URL", "https://aipipe.org/openai/v1/chat/completions")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
 TOKEN = os.environ.get("AIPIPE_TOKEN", "")
+RULES_WIN = os.environ.get("RULES_WIN", "1") == "1"
 MAX_PARALLEL = int(os.environ.get("LLM_PARALLEL", "2"))
 CLIENT = httpx.Client(timeout=httpx.Timeout(30.0, connect=5.0))
 GATE = threading.Semaphore(MAX_PARALLEL)          # global: protects the provider rate limit
@@ -90,25 +91,47 @@ def extract(pkg):
 
 # ------------------------------------------------------------------ keyword fallback
 def keyword_action(text):
-    t = text.lower()
-    neg = lambda w: re.search(r"\b(no|not|never|without|nor|rather than)\b[^.]{0,40}" + w, t)
-    if re.search(r"conflict|mismatch|disagree|do not agree|does not agree|inconsistent|differs? from|"
-                 r"discrepanc|exception workflow", t) and not neg(r"(conflict|mismatch|discrepanc)"):
-        return "open_exception"
-    if re.search(r"already (been )?paid|previously paid|paid in full|duplicate (payment|submission|of)|"
-                 r"same invoice", t) and not neg(r"(paid|duplicate)"):
+    """Deterministic reading of the decisive paragraph. Returns an action, or None when unsure."""
+    t = " ".join(text.lower().split())
+    has = lambda p: re.search(p, t) is not None
+
+    # 1. duplicate: an earlier payment of the SAME invoice (a different invoice is not a duplicate)
+    different = has(r"different (signed )?(commercial )?invoice|not (a|the) (same|duplicate)|is not a duplicate|"
+                    r"no (earlier|prior) (payment|posting)")
+    if not different and has(r"(earlier|prior|previous|completed) (payment|posting|settled entry|remittance)|"
+                             r"already (been )?(paid|settled)|paid-items ledger|same commercial key|"
+                             r"earlier settled entry|duplicate (payment|submission)"):
         return "reject_duplicate"
-    if re.search(r"outside[^.]{0,40}authority|exceeds?[^.]{0,40}(authority|limit|threshold)|"
-                 r"approval workflow|financial-approval|requires? (an? )?approv", t):
+
+    # 2. conflicting records -> exception workflow
+    no_discrepancy = has(r"\bno\b[^.]{0,80}(discrepanc|conflict|mismatch|exception)[^.]{0,20}(remains|exists|found)?")
+    if has(r"\bconflicts?\b|contradictory|mutually inconsistent|mutually incompatible|does not reconcile|"
+           r"do not reconcile|cannot be reconciled|outside the permitted reconciliation tolerance|beyond tolerance|"
+           r"\bmismatch|disagree|exception workflow") and not has(r"no (price|quantity)?[^.]{0,60}conflict"):
+        return "open_exception"
+    if has(r"discrepanc") and not no_discrepancy:
+        return "open_exception"
+
+    # 3. over delegated authority -> approval
+    if has(r"outside[^.]{0,60}authority|exceeds?[^.]{0,60}(authority|delegat|limit|threshold|ceiling|autonomous)|"
+           r"only up to|above[^.]{0,40}(authority|delegation|limit)|approval workflow|financial-approval|"
+           r"requires? (an? )?(named |senior |financial )?approv|beyond[^.]{0,40}(authority|delegation)"):
         return "request_approval"
-    if re.search(r"\bhold\b|pause|pending|callback|until[^.]{0,60}(verif|confirm|receiv)|awaiting|"
-                 r"not yet (been )?(verified|confirmed|received)|outstanding|unverified|must be (verified|confirmed)", t) \
-            and not neg(r"(hold|pause|pending|outstanding)"):
-        return "hold_invoice"
-    if re.search(r"within[^.]{0,50}(authority|limit|threshold)|autonomous(ly)? settle|may be settled|"
-                 r"cleared for (payment|settlement)|approved for payment|can be paid|release(d)? for payment", t):
+
+    # 4. pending verification -> hold
+    if has(r"callback|beneficiary details|destination-account|bank account|bank-detail change|"
+           r"has not (yet )?(been )?(completed|confirmed|verified)|not yet (been )?(verified|confirmed|received)|"
+           r"neither confirmed nor rejected|pending (verification|confirmation|receipt)|awaiting|until[^.]{0,60}"
+           r"(verif|confirm|complete)|\bhold\b|\bpause"):
+        if not has(r"no (hold|pause|pending)|not (on )?hold|hold is not|without (a )?hold"):
+            return "hold_invoice"
+
+    # 5. clean and within authority -> settle
+    if has(r"within[^.]{0,60}(authority|limit|delegation|threshold)|reconcile[ds]?[^.]{0,90}(without|with no) "
+           r"(an )?exception|with no exception|agree within the stated rounding tolerance|same payable total|covers every billed unit|"
+           r"may be settled|cleared for (payment|settlement)|approved for payment|release(d)? for payment"):
         return "settle_invoice"
-    return None                                   # no clear signal: never default to settlement
+    return None
 
 
 # ------------------------------------------------------------------ model call
@@ -156,6 +179,8 @@ def llm(packages):
         for d in _post("\n\n".join(blocks), t0 + 32):
             if isinstance(d, dict) and isinstance(d.get("index"), int):
                 model[d["index"]] = d
+    except httpx.HTTPStatusError as exc:
+        print("model unavailable, using keyword rules:", exc.response.status_code, exc.response.text[:400], flush=True)
     except Exception as exc:
         print("model unavailable, using keyword rules:", repr(exc), flush=True)
 
@@ -168,8 +193,15 @@ def llm(packages):
         k = ord(str(d.get("paragraph", "A")).strip()[:1].upper() or "A") - 65
         chosen = cands[k] if 0 <= k < len(cands[:6]) and not cands[k]["decoy"] else cands[0]
         rule = keyword_action(chosen["text"])
-        action = d.get("action") if d.get("action") in ACTIONS else (rule or "hold_invoice")
-        src = "model" if d.get("action") in ACTIONS else "rules"
+        m_act = d.get("action") if d.get("action") in ACTIONS else None
+        if rule and m_act and rule != m_act:
+            print("DISAGREE model", m_act, "rules", rule, flush=True)
+        if rule and (RULES_WIN or not m_act):
+            action, src = rule, ("model+rules" if m_act == rule else "rules")
+        elif m_act:
+            action, src = m_act, "model"
+        else:
+            action, src = "hold_invoice", "rules-default"
         if action == "settle_invoice" and rule != "settle_invoice":
             # settling the wrong invoice is the costliest mistake: only settle when the text clearly allows it
             print("SETTLE GUARD", src, "->", rule or "hold_invoice", flush=True)
@@ -177,7 +209,7 @@ def llm(packages):
         if facts is None:
             facts = {"vendorName": "", "invoiceNumber": "", "amountMinor": 0, "currency": ""}
             print("COVER NOT PARSED", json.dumps(cover or "")[:300], flush=True)
-        print("PICK", i, src, action, "|", chosen["text"][:160], flush=True)
+        print("PICK", i, src, action, "|", " ".join(chosen["text"].split())[:420], flush=True)
         out.append({"action": action, "decisive_paragraph": chosen["text"], "evidenceRefs": chosen["refs"][:3],
                     "facts": dict(facts), "rationale": str(d.get("why", "")),
                     "_quote": chosen["text"], "_src": src})
