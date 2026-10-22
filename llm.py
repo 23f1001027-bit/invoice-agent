@@ -33,7 +33,7 @@ ZERO_DEC = {"JPY", "KRW", "VND", "CLP", "ISK"}
 SYSTEM = """You are an accounts-payable controller. Each invoice package below lists its candidate evidence paragraphs (A, B, C...). Exactly one paragraph is DECISIVE: it states the conclusion for THIS invoice. Archive notes, training appendices, examples and superseded drafts are never decisive, even if they contain action words.
 
 Choose the action that the decisive paragraph determines:
-- settle_invoice: records reconcile and the amount is WITHIN autonomous authority; nothing pending.
+- settle_invoice: ONLY when the decisive paragraph affirmatively says records reconcile, the amount is WITHIN autonomous authority, and nothing is pending, conflicting or already paid. If in doubt between settle_invoice and another action, choose the other action.
 - request_approval: commercially valid / payable but OUTSIDE the operator's authority, so the approval workflow is needed.
 - hold_invoice: payment must pause until a stated verification completes (callback, certificate, confirmation pending).
 - reject_duplicate: this SAME invoice (same vendor and invoice number) was already paid. A payment for a DIFFERENT invoice is not a duplicate.
@@ -101,10 +101,14 @@ def keyword_action(text):
     if re.search(r"outside[^.]{0,40}authority|exceeds?[^.]{0,40}(authority|limit|threshold)|"
                  r"approval workflow|financial-approval|requires? (an? )?approv", t):
         return "request_approval"
-    if re.search(r"\bhold\b|pause|pending|callback|until[^.]{0,60}(verif|confirm|receiv)|awaiting", t) \
-            and not neg(r"(hold|pause|pending)"):
+    if re.search(r"\bhold\b|pause|pending|callback|until[^.]{0,60}(verif|confirm|receiv)|awaiting|"
+                 r"not yet (been )?(verified|confirmed|received)|outstanding|unverified|must be (verified|confirmed)", t) \
+            and not neg(r"(hold|pause|pending|outstanding)"):
         return "hold_invoice"
-    return "settle_invoice"
+    if re.search(r"within[^.]{0,50}(authority|limit|threshold)|autonomous(ly)? settle|may be settled|"
+                 r"cleared for (payment|settlement)|approved for payment|can be paid|release(d)? for payment", t):
+        return "settle_invoice"
+    return None                                   # no clear signal: never default to settlement
 
 
 # ------------------------------------------------------------------ model call
@@ -163,8 +167,13 @@ def llm(packages):
         d = model.get(i) or {}
         k = ord(str(d.get("paragraph", "A")).strip()[:1].upper() or "A") - 65
         chosen = cands[k] if 0 <= k < len(cands[:6]) and not cands[k]["decoy"] else cands[0]
-        action = d.get("action") if d.get("action") in ACTIONS else keyword_action(chosen["text"])
+        rule = keyword_action(chosen["text"])
+        action = d.get("action") if d.get("action") in ACTIONS else (rule or "hold_invoice")
         src = "model" if d.get("action") in ACTIONS else "rules"
+        if action == "settle_invoice" and rule != "settle_invoice":
+            # settling the wrong invoice is the costliest mistake: only settle when the text clearly allows it
+            print("SETTLE GUARD", src, "->", rule or "hold_invoice", flush=True)
+            action, src = rule or "hold_invoice", src + "+guard"
         if facts is None:
             facts = {"vendorName": "", "invoiceNumber": "", "amountMinor": 0, "currency": ""}
             print("COVER NOT PARSED", json.dumps(cover or "")[:300], flush=True)

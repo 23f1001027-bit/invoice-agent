@@ -28,7 +28,7 @@ LIST_BUDGET = 380 * 1024
 
 BASE_URL = os.environ.get("BASE_URL", "").strip()
 CHUNK = int(os.environ.get("CHUNK", "12"))
-PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "v5") + "|" + os.environ.get("LLM_MODEL", "gpt-4.1-mini")
+PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "v6") + "|" + os.environ.get("LLM_MODEL", "gpt-4.1-mini")
 DEBUG = os.environ.get("DEBUG_LOG", "1") == "1"
 STRIP_BRACKETS = os.environ.get("STRIP_BRACKETS", "1") == "1"
 DB_PATH = os.environ.get("DB_PATH", "/tmp/invoice_agent.db")
@@ -213,7 +213,7 @@ def decide(packages, llm):
         for i, dec in got.items():
             if dec:
                 result[i] = dec
-                if dec.get("src") == "model":         # rule-based answers are retried next time
+                if str(dec.get("src", "")).startswith("model"):         # rule-based answers are retried next time
                     STORE.save_decision(keys[i], dec)
         todo = [i for i, r in enumerate(result) if r is None]
     for i in todo:
