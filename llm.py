@@ -19,8 +19,9 @@ LLM_URL = os.environ.get("LLM_URL", "https://aipipe.org/openai/v1/chat/completio
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
 TOKEN = os.environ.get("AIPIPE_TOKEN", "")
 RULES_WIN = os.environ.get("RULES_WIN", "1") == "1"
+MODEL_BUDGET = float(os.environ.get("MODEL_BUDGET", "15"))
 MAX_PARALLEL = int(os.environ.get("LLM_PARALLEL", "2"))
-CLIENT = httpx.Client(timeout=httpx.Timeout(30.0, connect=5.0))
+CLIENT = httpx.Client(timeout=httpx.Timeout(15.0, connect=5.0))
 GATE = threading.Semaphore(MAX_PARALLEL)          # global: protects the provider rate limit
 
 REF_RE = re.compile(r"\[[A-Za-z0-9][^\[\]\"\n,]{0,80}\]")
@@ -135,22 +136,32 @@ def keyword_action(text):
 
 
 # ------------------------------------------------------------------ model call
+_breaker = {"until": 0.0}                         # skip the model for a while after a config error
+
+
 def _post(user, deadline):
+    if time.time() < _breaker["until"]:
+        raise RuntimeError("model disabled after a recent configuration error")
     body = {"model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]}
-    delay = 1.5
+    delay = 1.0
     while True:
         left = deadline - time.time()
-        if left < 4:
+        if left < 3 or not GATE.acquire(timeout=max(0.1, left - 3)):
             raise TimeoutError("no time left for the model")
-        with GATE:
+        try:
+            left = deadline - time.time()
             r = CLIENT.post(LLM_URL, headers={"Authorization": f"Bearer {TOKEN}"}, json=body,
-                            timeout=httpx.Timeout(min(25.0, left), connect=5.0))
-        if r.status_code in (429, 500, 502, 503) and deadline - time.time() > delay + 6:
+                            timeout=httpx.Timeout(max(1.0, left), connect=min(5.0, max(1.0, left))))
+        finally:
+            GATE.release()
+        if r.status_code in (429, 500, 502, 503) and deadline - time.time() > delay + 4:
             print("LLM", r.status_code, "retrying in", delay, flush=True)
             time.sleep(delay)
             delay *= 2
             continue
+        if r.status_code in (400, 401, 403, 404):
+            _breaker["until"] = time.time() + 600
         r.raise_for_status()
         j = r.json()
         print("LLM usage", json.dumps(j.get("usage", {})), flush=True)
@@ -158,31 +169,44 @@ def _post(user, deadline):
         return json.loads(re.search(r"\{.*\}", text, re.S).group(0)).get("decisions", [])
 
 
+def _block(i, facts, cover, cands):
+    lines = [f"=== PACKAGE index={i} ==="]
+    if facts:
+        lines.append(f"Invoice: {facts['vendorName']} / {facts['invoiceNumber']} / "
+                     f"{facts['currency']} {facts['amountMinor']} minor units")
+    elif cover:
+        lines.append("Cover: " + cover)
+    for k, c in enumerate(cands[:6]):
+        lines.append(f"{chr(65 + k)}: {c['text']}")
+    return "\n".join(lines)
+
+
 def llm(packages):
-    """Returns raw decision dicts aligned with `packages` (core.normalize validates them)."""
+    """Returns raw decision dicts aligned with `packages` (core.normalize validates them).
+
+    Packages whose decisive paragraph the rules read with confidence need no model call;
+    only the remaining ones go to the model, in one call, within a hard time budget.
+    """
     t0 = time.time()
     extracted = [extract(p) for p in packages]
-    blocks = []
+    first_rule = {}
     for i, (facts, cover, cands) in enumerate(extracted):
-        lines = [f"=== PACKAGE index={i} ==="]
-        if facts:
-            lines.append(f"Invoice: {facts['vendorName']} / {facts['invoiceNumber']} / "
-                         f"{facts['currency']} {facts['amountMinor']} minor units")
-        elif cover:
-            lines.append("Cover: " + cover)
-        for k, c in enumerate(cands[:6]):
-            lines.append(f"{chr(65 + k)}: {c['text']}")
-        blocks.append("\n".join(lines))
+        clean = [c for c in cands if not c["decoy"]]
+        if len(clean) == 1 or (clean and len(clean[0]["refs"]) == 3 and all(len(c["refs"]) != 3 for c in clean[1:])):
+            first_rule[i] = keyword_action(clean[0]["text"])
+    ask = [i for i, (_, _, cands) in enumerate(extracted) if cands and not first_rule.get(i)]
 
     model = {}
-    try:
-        for d in _post("\n\n".join(blocks), t0 + 32):
-            if isinstance(d, dict) and isinstance(d.get("index"), int):
-                model[d["index"]] = d
-    except httpx.HTTPStatusError as exc:
-        print("model unavailable, using keyword rules:", exc.response.status_code, exc.response.text[:400], flush=True)
-    except Exception as exc:
-        print("model unavailable, using keyword rules:", repr(exc), flush=True)
+    if ask:
+        try:
+            user = "\n\n".join(_block(n, *extracted[i]) for n, i in enumerate(ask))
+            for d in _post(user, t0 + MODEL_BUDGET):
+                if isinstance(d, dict) and isinstance(d.get("index"), int) and 0 <= d["index"] < len(ask):
+                    model[ask[d["index"]]] = d
+        except httpx.HTTPStatusError as exc:
+            print("model unavailable, using keyword rules:", exc.response.status_code, exc.response.text[:400], flush=True)
+        except Exception as exc:
+            print("model unavailable, using keyword rules:", repr(exc), flush=True)
 
     out = []
     for i, (facts, cover, cands) in enumerate(extracted):
